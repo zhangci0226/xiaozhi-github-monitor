@@ -216,9 +216,128 @@ def changed_key_files(client: GitHubClient, commits: list[dict[str, Any]]) -> li
     return files[:12]
 
 
+def extract_markdown_section(markdown: str, heading: str, max_items: int = 12) -> list[str]:
+    lines = markdown.splitlines()
+    start_index = None
+    heading_pattern = re.compile(r"^#{2,6}\s+" + re.escape(heading) + r"\s*$", re.IGNORECASE)
+    any_heading_pattern = re.compile(r"^#{1,6}\s+")
+    for index, line in enumerate(lines):
+        if heading_pattern.match(line.strip()):
+            start_index = index + 1
+            break
+    if start_index is None:
+        return []
+
+    items: list[str] = []
+    for line in lines[start_index:]:
+        stripped = line.strip()
+        if any_heading_pattern.match(stripped):
+            break
+        if stripped.startswith("- "):
+            items.append(stripped[2:].strip())
+        elif stripped and not items:
+            items.append(stripped)
+        if len(items) >= max_items:
+            break
+    return items
+
+
+def fetch_readme_text(client: GitHubClient) -> str | None:
+    readme = client.get("/readme")
+    download_url = readme.get("download_url")
+    if not download_url:
+        return None
+    req = urllib.request.Request(download_url, headers={"User-Agent": "xiaozhi-github-monitor"})
+    with urllib.request.urlopen(req, timeout=30) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def fetch_project_snapshot(client: GitHubClient) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {
+        "latest_version": None,
+        "published_at": None,
+        "release_url": None,
+        "release_notes": None,
+        "features": [],
+        "version_notes": [],
+        "source": None,
+    }
+
+    try:
+        releases = client.get("/releases", {"per_page": "5"})
+        if releases:
+            latest = releases[0]
+            snapshot.update(
+                {
+                    "latest_version": latest.get("tag_name") or latest.get("name"),
+                    "published_at": latest.get("published_at") or latest.get("created_at"),
+                    "release_url": latest.get("html_url"),
+                    "release_notes": first_line(latest.get("body"), 220),
+                    "source": "release",
+                }
+            )
+    except Exception as exc:
+        print(f"Failed to fetch releases for snapshot: {exc}", file=sys.stderr)
+
+    if not snapshot["latest_version"]:
+        try:
+            tags = client.get("/tags", {"per_page": "1"})
+            if tags:
+                tag_name = tags[0].get("name")
+                snapshot.update(
+                    {
+                        "latest_version": tag_name,
+                        "release_url": f"https://github.com/{client.repo}/releases/tag/{tag_name}",
+                        "source": "tag",
+                    }
+                )
+        except Exception as exc:
+            print(f"Failed to fetch tags for snapshot: {exc}", file=sys.stderr)
+
+    try:
+        readme_text = fetch_readme_text(client)
+        if readme_text:
+            snapshot["features"] = extract_markdown_section(readme_text, "Features Implemented", max_items=8)
+            snapshot["version_notes"] = extract_markdown_section(readme_text, "Version Notes", max_items=4)
+    except Exception as exc:
+        print(f"Failed to fetch README for snapshot: {exc}", file=sys.stderr)
+
+    return snapshot
+
+
+def format_snapshot(snapshot: dict[str, Any], changes: dict[str, list[dict[str, Any]]], key_files: list[str]) -> str:
+    total = sum(len(items) for items in changes.values()) + len(key_files)
+    lines = ["## 项目现状"]
+    if snapshot.get("latest_version"):
+        lines.append(f"- 最新版本：{snapshot['latest_version']}")
+    if snapshot.get("published_at"):
+        published = parse_time(snapshot["published_at"]).date().isoformat()
+        lines.append(f"- 发布时间：{published}")
+    if snapshot.get("release_url"):
+        lines.append(f"- Release：{snapshot['release_url']}")
+    if snapshot.get("release_notes"):
+        lines.append(f"- 版本说明：{snapshot['release_notes']}")
+    lines.append(f"- 今日变化：{'没有新的 release、tag、commit、issue 或 PR' if total == 0 else f'发现 {total} 项变化'}")
+
+    features = snapshot.get("features") or []
+    if features:
+        lines.extend(["", "### 当前主要功能"])
+        for feature in features[:8]:
+            lines.append(f"- {feature}")
+
+    version_notes = snapshot.get("version_notes") or []
+    if version_notes:
+        lines.extend(["", "### 升级/兼容注意"])
+        for note in version_notes[:4]:
+            lines.append(f"- {note}")
+
+    return "\n".join(lines)
+
+
 def compact_change_context(
     changes: dict[str, list[dict[str, Any]]],
     key_files: list[str],
+    snapshot: dict[str, Any] | None = None,
 ) -> str:
     payload: dict[str, Any] = {
         "releases": [],
@@ -227,6 +346,7 @@ def compact_change_context(
         "key_files": key_files[:12],
         "pull_requests": [],
         "issues": [],
+        "project_snapshot": snapshot or {},
     }
     for release in changes["releases"][:5]:
         payload["releases"].append(
@@ -280,6 +400,7 @@ def build_ai_prompt(
     repo: str,
     changes: dict[str, list[dict[str, Any]]],
     key_files: list[str],
+    snapshot: dict[str, Any] | None = None,
 ) -> str:
     return f"""
 你是一个懂嵌入式 AI 语音助手项目的产品更新编辑。请把 GitHub 技术变更翻译成普通用户能看懂的中文日报。
@@ -289,18 +410,19 @@ def build_ai_prompt(
 要求：
 - 不要逐条翻译 commit。
 - 重点回答：新增了什么功能、改变了什么行为、修复了什么问题、我是否需要关注或更新配置。
+- 如果今天没有变化，请改为说明当前最新版本、目前能做什么、需要关注的升级兼容事项。
 - 如果只能从标题推断，请明确用“看起来”或“可能”。
 - 不要夸大，没有证据就说“未看到明确的新功能”。
-- 输出 Markdown，控制在 180-260 个中文字符左右。
+- 输出 Markdown，控制在 220-360 个中文字符左右。
 - 固定结构：
   ## AI 通俗总结
   **一句话：**...
-  **主要变化：**
+  **主要变化/当前能力：**
   - ...
   **需要关注：**...
 
 原始变更数据：
-{compact_change_context(changes, key_files)}
+{compact_change_context(changes, key_files, snapshot)}
 """.strip()
 
 
@@ -309,16 +431,17 @@ def generate_deepseek_summary(
     repo: str,
     changes: dict[str, list[dict[str, Any]]],
     key_files: list[str],
+    snapshot: dict[str, Any] | None = None,
 ) -> str | None:
     total = sum(len(items) for items in changes.values()) + len(key_files)
-    if total == 0:
+    if total == 0 and not snapshot:
         return None
 
     payload = {
         "model": os.getenv("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL),
         "messages": [
             {"role": "system", "content": "你擅长把开源项目技术更新写成普通用户能看懂的中文简报。"},
-            {"role": "user", "content": build_ai_prompt(repo, changes, key_files)},
+            {"role": "user", "content": build_ai_prompt(repo, changes, key_files, snapshot)},
         ],
         "temperature": 0.2,
         "max_tokens": 500,
@@ -363,14 +486,15 @@ def generate_openai_summary(
     repo: str,
     changes: dict[str, list[dict[str, Any]]],
     key_files: list[str],
+    snapshot: dict[str, Any] | None = None,
 ) -> str | None:
     total = sum(len(items) for items in changes.values()) + len(key_files)
-    if total == 0:
+    if total == 0 and not snapshot:
         return None
 
     payload = {
         "model": os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
-        "input": build_ai_prompt(repo, changes, key_files),
+        "input": build_ai_prompt(repo, changes, key_files, snapshot),
         "temperature": 0.2,
         "max_output_tokens": 500,
     }
@@ -415,9 +539,11 @@ def build_summary(
     changes: dict[str, list[dict[str, Any]]],
     key_files: list[str],
     checked_at: str,
+    snapshot: dict[str, Any] | None = None,
+    force_snapshot: bool = False,
 ) -> str | None:
     total = sum(len(items) for items in changes.values()) + len(key_files)
-    if total == 0:
+    if total == 0 and not force_snapshot:
         return None
 
     all_text = " ".join(
@@ -436,8 +562,12 @@ def build_summary(
         f"> 仓库：{markdown_link(repo, repo_url)}",
         f"> 检查时间：{checked_at}",
         "",
-        f"**今日结论：**发现 {total} 项变化"
-        + (f"，重点关注：{', '.join(dict.fromkeys(hits[:8]))}" if hits else "。"),
+        (
+            f"**今日结论：**发现 {total} 项变化"
+            + (f"，重点关注：{', '.join(dict.fromkeys(hits[:8]))}" if hits else "。")
+            if total
+            else "**今日结论：**没有发现新的 release、tag、commit、issue 或 PR。"
+        ),
     ]
 
     if changes["releases"]:
@@ -479,6 +609,9 @@ def build_summary(
         for issue in changes["issues"][:10]:
             state = "已关闭" if issue.get("state") == "closed" else "打开"
             lines.append(f"- #{issue.get('number')} [{state}] {markdown_link(issue.get('title', ''), issue.get('html_url'))}")
+
+    if snapshot:
+        lines.extend(["", format_snapshot(snapshot, changes, key_files)])
 
     lines.extend(["", f"查看仓库：{repo_url}"])
     return "\n".join(lines)
@@ -563,27 +696,28 @@ def main() -> int:
     state = load_state(state_path)
     changes, new_state = collect_changes(client, state)
     key_files = changed_key_files(client, changes["commits"])
+    snapshot = fetch_project_snapshot(client) if args.force_send or sum(len(items) for items in changes.values()) + len(key_files) else None
     checked_at = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-    technical_summary = build_summary(args.repo, changes, key_files, checked_at)
+    technical_summary = build_summary(
+        args.repo,
+        changes,
+        key_files,
+        checked_at,
+        snapshot=snapshot,
+        force_snapshot=args.force_send,
+    )
     ai_summary = None
     if deepseek_api_key and technical_summary:
         try:
-            ai_summary = generate_deepseek_summary(deepseek_api_key, args.repo, changes, key_files)
+            ai_summary = generate_deepseek_summary(deepseek_api_key, args.repo, changes, key_files, snapshot)
         except Exception as exc:
             print(f"DeepSeek summary failed; falling back to technical summary: {exc}", file=sys.stderr)
     elif openai_api_key and technical_summary:
         try:
-            ai_summary = generate_openai_summary(openai_api_key, args.repo, changes, key_files)
+            ai_summary = generate_openai_summary(openai_api_key, args.repo, changes, key_files, snapshot)
         except Exception as exc:
             print(f"AI summary failed; falling back to technical summary: {exc}", file=sys.stderr)
     summary = combine_ai_and_technical_summary(ai_summary, technical_summary)
-
-    if not summary and args.force_send:
-        summary = (
-            "## 小智 AI 项目日报\n"
-            f"> 仓库：{args.repo}\n\n"
-            "今日没有发现新的 release、tag、commit、issue 或 PR 变化。"
-        )
 
     if summary:
         print(summary)

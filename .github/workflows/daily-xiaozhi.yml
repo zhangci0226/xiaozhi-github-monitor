@@ -9,11 +9,11 @@ on:
       force_send:
         description: "Send a message even when no changes are found"
         required: false
-        default: "false"
+        default: "true"
         type: choice
         options:
-          - "false"
           - "true"
+          - "false"
 
 permissions:
   contents: write

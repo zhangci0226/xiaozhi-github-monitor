@@ -20,6 +20,39 @@ class MonitorTests(unittest.TestCase):
 
         self.assertIsNone(monitor.build_summary("78/xiaozhi-esp32", changes, [], "2026-07-15 09:00:00 HKT"))
 
+    def test_build_summary_includes_snapshot_when_forced_without_changes(self):
+        changes = {
+            "releases": [],
+            "tags": [],
+            "commits": [],
+            "issues": [],
+            "pull_requests": [],
+        }
+        snapshot = {
+            "latest_version": "v2.2.6",
+            "published_at": "2026-04-19T19:32:03Z",
+            "release_url": "https://github.com/78/xiaozhi-esp32/releases/tag/v2.2.6",
+            "release_notes": "Add support for a new board",
+            "features": ["Wi-Fi / ML307 Cat.1 4G", "Offline voice wake-up"],
+            "version_notes": ["The current v2 version is incompatible with the v1 partition table."],
+        }
+
+        summary = monitor.build_summary(
+            "78/xiaozhi-esp32",
+            changes,
+            [],
+            "2026-07-15 09:00:00 HKT",
+            snapshot=snapshot,
+            force_snapshot=True,
+        )
+
+        self.assertIsNotNone(summary)
+        self.assertIn("项目现状", summary)
+        self.assertIn("最新版本：v2.2.6", summary)
+        self.assertIn("当前主要功能", summary)
+        self.assertIn("升级/兼容注意", summary)
+        self.assertIn("没有发现新的 release", summary)
+
     def test_build_summary_includes_core_sections_and_keywords(self):
         changes = {
             "releases": [
@@ -110,6 +143,52 @@ class MonitorTests(unittest.TestCase):
         }
 
         self.assertEqual(monitor.extract_chat_completion_text(response), "## AI 通俗总结\n这是 DeepSeek 生成的摘要。")
+
+    def test_extract_markdown_section_reads_features(self):
+        markdown = """# Project
+
+## Version Notes
+
+The current v2 version is incompatible with the v1 partition table.
+
+### Features Implemented
+
+- Wi-Fi / ML307 Cat.1 4G
+- Offline voice wake-up
+- Supports ESP32-C3, ESP32-S3, ESP32-P4 chip platforms
+
+## Hardware
+"""
+
+        features = monitor.extract_markdown_section(markdown, "Features Implemented")
+        notes = monitor.extract_markdown_section(markdown, "Version Notes")
+
+        self.assertEqual(features[0], "Wi-Fi / ML307 Cat.1 4G")
+        self.assertIn("ESP32-P4", features[2])
+        self.assertIn("partition table", notes[0])
+
+    def test_format_snapshot_falls_back_to_tag_version(self):
+        changes = {
+            "releases": [],
+            "tags": [],
+            "commits": [],
+            "issues": [],
+            "pull_requests": [],
+        }
+        snapshot = {
+            "latest_version": "v2.2.6",
+            "published_at": None,
+            "release_url": "https://github.com/78/xiaozhi-esp32/releases/tag/v2.2.6",
+            "release_notes": None,
+            "features": [],
+            "version_notes": [],
+            "source": "tag",
+        }
+
+        formatted = monitor.format_snapshot(snapshot, changes, [])
+
+        self.assertIn("最新版本：v2.2.6", formatted)
+        self.assertIn("今日变化：没有新的 release", formatted)
 
 
 if __name__ == "__main__":
