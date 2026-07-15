@@ -1,0 +1,57 @@
+name: Daily xiaozhi-esp32 monitor
+
+on:
+  schedule:
+    # 09:00 Asia/Hong_Kong = 01:00 UTC
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+    inputs:
+      force_send:
+        description: "Send a message even when no changes are found"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout monitor repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run monitor
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          PUSHPLUS_CHANNEL: clawbot
+          WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
+          TARGET_REPO: 78/xiaozhi-esp32
+        run: |
+          FORCE_FLAG=""
+          if [ "${{ github.event.inputs.force_send }}" = "true" ]; then
+            FORCE_FLAG="--force-send"
+          fi
+          python monitor.py $FORCE_FLAG
+
+      - name: Commit updated state
+        run: |
+          if git diff --quiet -- state.json; then
+            echo "state.json unchanged"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git commit -m "Update xiaozhi monitor state"
+          git push
