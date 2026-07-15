@@ -77,6 +77,40 @@ class MonitorTests(unittest.TestCase):
 
         self.assertEqual(parsed, dt.datetime(2026, 7, 15, 1, 2, 3, tzinfo=dt.timezone.utc))
 
+    def test_combine_ai_and_technical_summary(self):
+        combined = monitor.combine_ai_and_technical_summary("## AI 通俗总结\n很好懂", "## 小智 AI 项目日报\n技术明细")
+
+        self.assertIn("## AI 通俗总结", combined)
+        self.assertIn("---", combined)
+        self.assertIn("## 小智 AI 项目日报", combined)
+
+    def test_extract_response_text_from_responses_api_output(self):
+        response = {
+            "output": [
+                {
+                    "content": [
+                        {"type": "output_text", "text": "## AI 通俗总结\n主要变化很清楚。"},
+                    ]
+                }
+            ]
+        }
+
+        self.assertEqual(monitor.extract_response_text(response), "## AI 通俗总结\n主要变化很清楚。")
+
+    def test_extract_chat_completion_text_from_deepseek_output(self):
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "## AI 通俗总结\n这是 DeepSeek 生成的摘要。",
+                    }
+                }
+            ]
+        }
+
+        self.assertEqual(monitor.extract_chat_completion_text(response), "## AI 通俗总结\n这是 DeepSeek 生成的摘要。")
+
 
 if __name__ == "__main__":
     unittest.main()

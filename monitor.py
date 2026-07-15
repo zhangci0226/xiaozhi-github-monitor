@@ -25,6 +25,8 @@ from typing import Any
 DEFAULT_REPO = "78/xiaozhi-esp32"
 DEFAULT_STATE_PATH = "state.json"
 DEFAULT_INITIAL_LOOKBACK_HOURS = 24
+DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
+DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
 IMPORTANT_KEYWORDS = [
     "OTA",
     "唤醒词",
@@ -214,6 +216,185 @@ def changed_key_files(client: GitHubClient, commits: list[dict[str, Any]]) -> li
     return files[:12]
 
 
+def compact_change_context(
+    changes: dict[str, list[dict[str, Any]]],
+    key_files: list[str],
+) -> str:
+    payload: dict[str, Any] = {
+        "releases": [],
+        "tags": [],
+        "commits": [],
+        "key_files": key_files[:12],
+        "pull_requests": [],
+        "issues": [],
+    }
+    for release in changes["releases"][:5]:
+        payload["releases"].append(
+            {
+                "name": release.get("name") or release.get("tag_name"),
+                "body": first_line(release.get("body"), 300),
+                "url": release.get("html_url"),
+            }
+        )
+    for tag in changes["tags"][:8]:
+        payload["tags"].append({"name": tag.get("name")})
+    for commit in changes["commits"][:12]:
+        payload["commits"].append(
+            {
+                "sha": (commit.get("sha") or "")[:7],
+                "message": first_line(commit.get("commit", {}).get("message"), 220),
+                "url": commit.get("html_url"),
+            }
+        )
+    for pr in changes["pull_requests"][:10]:
+        payload["pull_requests"].append(
+            {
+                "number": pr.get("number"),
+                "state": pr.get("state"),
+                "title": pr.get("title"),
+                "url": pr.get("html_url"),
+            }
+        )
+    for issue in changes["issues"][:10]:
+        payload["issues"].append(
+            {
+                "number": issue.get("number"),
+                "state": issue.get("state"),
+                "title": issue.get("title"),
+                "url": issue.get("html_url"),
+            }
+        )
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def extract_chat_completion_text(response: dict[str, Any]) -> str:
+    choices = response.get("choices", [])
+    if not choices:
+        return ""
+    message = choices[0].get("message", {})
+    content = message.get("content")
+    return content.strip() if isinstance(content, str) else ""
+
+
+def build_ai_prompt(
+    repo: str,
+    changes: dict[str, list[dict[str, Any]]],
+    key_files: list[str],
+) -> str:
+    return f"""
+你是一个懂嵌入式 AI 语音助手项目的产品更新编辑。请把 GitHub 技术变更翻译成普通用户能看懂的中文日报。
+
+仓库：{repo}
+
+要求：
+- 不要逐条翻译 commit。
+- 重点回答：新增了什么功能、改变了什么行为、修复了什么问题、我是否需要关注或更新配置。
+- 如果只能从标题推断，请明确用“看起来”或“可能”。
+- 不要夸大，没有证据就说“未看到明确的新功能”。
+- 输出 Markdown，控制在 180-260 个中文字符左右。
+- 固定结构：
+  ## AI 通俗总结
+  **一句话：**...
+  **主要变化：**
+  - ...
+  **需要关注：**...
+
+原始变更数据：
+{compact_change_context(changes, key_files)}
+""".strip()
+
+
+def generate_deepseek_summary(
+    api_key: str,
+    repo: str,
+    changes: dict[str, list[dict[str, Any]]],
+    key_files: list[str],
+) -> str | None:
+    total = sum(len(items) for items in changes.values()) + len(key_files)
+    if total == 0:
+        return None
+
+    payload = {
+        "model": os.getenv("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL),
+        "messages": [
+            {"role": "system", "content": "你擅长把开源项目技术更新写成普通用户能看懂的中文简报。"},
+            {"role": "user", "content": build_ai_prompt(repo, changes, key_files)},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 500,
+        "stream": False,
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.deepseek.com/chat/completions",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=45) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"DeepSeek API error {exc.code}: {body}") from exc
+
+    text = extract_chat_completion_text(result)
+    return text or None
+
+
+def extract_response_text(response: dict[str, Any]) -> str:
+    if isinstance(response.get("output_text"), str):
+        return response["output_text"].strip()
+
+    parts: list[str] = []
+    for item in response.get("output", []):
+        for content in item.get("content", []):
+            text = content.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def generate_openai_summary(
+    api_key: str,
+    repo: str,
+    changes: dict[str, list[dict[str, Any]]],
+    key_files: list[str],
+) -> str | None:
+    total = sum(len(items) for items in changes.values()) + len(key_files)
+    if total == 0:
+        return None
+
+    payload = {
+        "model": os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
+        "input": build_ai_prompt(repo, changes, key_files),
+        "temperature": 0.2,
+        "max_output_tokens": 500,
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/responses",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=45) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI API error {exc.code}: {body}") from exc
+
+    text = extract_response_text(result)
+    return text or None
+
+
 def markdown_link(title: str, url: str | None) -> str:
     safe_title = title.replace("[", "［").replace("]", "］")
     return f"[{safe_title}]({url})" if url else safe_title
@@ -352,6 +533,14 @@ def post_pushplus(token: str, content: str, dry_run: bool = False) -> None:
             raise RuntimeError(f"PushPlus returned an error: {body}")
 
 
+def combine_ai_and_technical_summary(ai_summary: str | None, technical_summary: str | None) -> str | None:
+    if not technical_summary:
+        return ai_summary
+    if not ai_summary:
+        return technical_summary
+    return f"{ai_summary}\n\n---\n\n{technical_summary}"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Send daily xiaozhi-esp32 GitHub updates to PushPlus/WeCom.")
     parser.add_argument("--repo", default=os.getenv("TARGET_REPO", DEFAULT_REPO))
@@ -366,6 +555,8 @@ def main() -> int:
     state_path = Path(args.state)
     token = os.getenv("GITHUB_TOKEN")
     pushplus_token = os.getenv("PUSHPLUS_TOKEN")
+    deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
+    openai_api_key = os.getenv("OPENAI_API_KEY")
     webhook_url = os.getenv("WECHAT_WEBHOOK_URL")
 
     client = GitHubClient(args.repo, token)
@@ -373,7 +564,19 @@ def main() -> int:
     changes, new_state = collect_changes(client, state)
     key_files = changed_key_files(client, changes["commits"])
     checked_at = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-    summary = build_summary(args.repo, changes, key_files, checked_at)
+    technical_summary = build_summary(args.repo, changes, key_files, checked_at)
+    ai_summary = None
+    if deepseek_api_key and technical_summary:
+        try:
+            ai_summary = generate_deepseek_summary(deepseek_api_key, args.repo, changes, key_files)
+        except Exception as exc:
+            print(f"DeepSeek summary failed; falling back to technical summary: {exc}", file=sys.stderr)
+    elif openai_api_key and technical_summary:
+        try:
+            ai_summary = generate_openai_summary(openai_api_key, args.repo, changes, key_files)
+        except Exception as exc:
+            print(f"AI summary failed; falling back to technical summary: {exc}", file=sys.stderr)
+    summary = combine_ai_and_technical_summary(ai_summary, technical_summary)
 
     if not summary and args.force_send:
         summary = (
